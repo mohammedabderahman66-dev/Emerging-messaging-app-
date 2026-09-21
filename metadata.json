@@ -1,0 +1,9 @@
+{
+  "name": "واتساب ويب - WhatsApp Web",
+  "description": "تطبيق محادثة فورية في الوقت الفعلي بواجهة واتساب الأيقونية مع دعم الرسائل، التسجيلات الصوتية، المرفقات وحالة الاتصال",
+  "requestFramePermissions": [
+    "microphone",
+    "camera"
+  ],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
