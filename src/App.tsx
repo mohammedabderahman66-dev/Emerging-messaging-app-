@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { App as CapApp } from '@capacitor/app';
+import { WifiOff } from 'lucide-react';
 import { Sidebar } from './components/Sidebar';
 import { ChatArea } from './components/ChatArea';
 import { CallModal } from './components/CallModal';
@@ -8,6 +10,15 @@ import { ContactInfoDrawer } from './components/ContactInfoDrawer';
 import { SettingsModal } from './components/SettingsModal';
 import { Chat, Message, User, ThemeMode, CallSession } from './types';
 import { sounds } from './utils/audio';
+import {
+  isNativeAndroid,
+  getApiBaseUrl,
+  getWebSocketUrl,
+  initializeAndroidNative,
+  requestNotificationPermission,
+  showAndroidNotification,
+  triggerHaptic,
+} from './config';
 
 const DEFAULT_USER: User = {
   id: 'user-me',
@@ -31,6 +42,10 @@ export default function App() {
   const [messages, setMessages] = useState<Record<string, Message[]>>({});
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [onlineCount, setOnlineCount] = useState<number>(1);
+  const [isWsConnected, setIsWsConnected] = useState<boolean>(false);
+  const [isNetworkOnline, setIsNetworkOnline] = useState<boolean>(
+    typeof navigator !== 'undefined' ? navigator.onLine : true
+  );
 
   // Modals & Panels
   const [showStatusModal, setShowStatusModal] = useState<boolean>(false);
@@ -42,11 +57,66 @@ export default function App() {
   const socketRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<number | null>(null);
 
-  // Persist theme & sound
+  // Android Native initialization & Theme sync
   useEffect(() => {
     localStorage.setItem('wa_theme', theme);
     document.documentElement.classList.toggle('dark', theme === 'dark');
+    initializeAndroidNative(theme);
   }, [theme]);
+
+  // Request notifications permission on Android
+  useEffect(() => {
+    requestNotificationPermission();
+
+    const handleOnline = () => setIsNetworkOnline(true);
+    const handleOffline = () => setIsNetworkOnline(false);
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
+
+  // Android Hardware Back Button Integration
+  useEffect(() => {
+    let backHandler: { remove: () => void } | null = null;
+
+    if (isNativeAndroid) {
+      CapApp.addListener('backButton', () => {
+        if (activeCall) {
+          setActiveCall(null);
+        } else if (showStatusModal) {
+          setShowStatusModal(false);
+        } else if (showNewChatModal) {
+          setShowNewChatModal(false);
+        } else if (showSettingsModal) {
+          setShowSettingsModal(false);
+        } else if (showContactInfo) {
+          setShowContactInfo(false);
+        } else if (activeChatId) {
+          setActiveChatId(null);
+        } else {
+          CapApp.exitApp();
+        }
+      }).then((handle) => {
+        backHandler = handle;
+      });
+    }
+
+    return () => {
+      if (backHandler?.remove) backHandler.remove();
+    };
+  }, [
+    activeCall,
+    showStatusModal,
+    showNewChatModal,
+    showSettingsModal,
+    showContactInfo,
+    activeChatId,
+  ]);
 
   useEffect(() => {
     localStorage.setItem('wa_sound', String(soundEnabled));
@@ -55,7 +125,10 @@ export default function App() {
 
   // Initial HTTP Fetch for fast render
   useEffect(() => {
-    fetch('/api/state')
+    const apiBase = getApiBaseUrl();
+    const endpoint = apiBase ? `${apiBase}/api/state` : '/api/state';
+
+    fetch(endpoint)
       .then((res) => res.json())
       .then((data) => {
         if (data.chats) {
@@ -82,12 +155,12 @@ export default function App() {
   // WebSocket Connection
   useEffect(() => {
     function connectWs() {
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}`;
+      const wsUrl = getWebSocketUrl();
       const ws = new WebSocket(wsUrl);
 
       ws.onopen = () => {
-        console.log('Connected to WhatsApp WebSocket server');
+        console.log('Connected to Emerging WebSocket server at:', wsUrl);
+        setIsWsConnected(true);
       };
 
       ws.onmessage = (event) => {
@@ -127,6 +200,17 @@ export default function App() {
                 sounds.playSent();
               } else {
                 sounds.playReceived();
+                // Trigger Android notification if chat is not currently open
+                if (targetChatId !== activeChatId) {
+                  const notifBody = newMsg.type === 'text' 
+                    ? (newMsg.text || 'رسالة جديدة')
+                    : newMsg.type === 'image'
+                    ? '📷 صورة'
+                    : newMsg.type === 'audio'
+                    ? '🎤 رسالة صوتية'
+                    : '📄 مستند';
+                  showAndroidNotification(newMsg.senderName || 'رسالة جديدة', notifBody);
+                }
               }
 
               // Update chats list
@@ -233,9 +317,15 @@ export default function App() {
       };
 
       ws.onclose = () => {
+        setIsWsConnected(false);
         reconnectTimeoutRef.current = window.setTimeout(() => {
           connectWs();
-        }, 2000);
+        }, 2500);
+      };
+
+      ws.onerror = (err) => {
+        console.warn('WebSocket connection error:', err);
+        setIsWsConnected(false);
       };
 
       socketRef.current = ws;
@@ -308,6 +398,7 @@ export default function App() {
           payload: messagePayload,
         })
       );
+      triggerHaptic();
     }
   };
 
@@ -428,17 +519,25 @@ export default function App() {
     <div 
       id="whatsapp-app-root"
       dir="rtl"
-      className={`w-screen h-screen flex overflow-hidden select-none font-['Cairo',system-ui,sans-serif] ${
+      className={`w-screen h-screen flex flex-col overflow-hidden select-none font-['Cairo',system-ui,sans-serif] ${
         theme === 'dark' ? 'bg-[#0c1317] text-[#e9edef]' : 'bg-[#d1d7db] text-[#111b21]'
       }`}
     >
+      {/* Offline/Reconnecting banner if disconnected */}
+      {(!isWsConnected || !isNetworkOnline) && (
+        <div className="w-full bg-[#ea4335] text-white py-1.5 px-4 text-xs flex items-center justify-center gap-2 z-50 animate-pulse font-medium shadow-md">
+          <WifiOff className="w-3.5 h-3.5" />
+          <span>لا يوجد اتصال بالإنترنت أو الخادم — جارٍ محاولة إعادة الاتصال تلقائياً...</span>
+        </div>
+      )}
+
       {/* Top green accent bar like authentic WhatsApp Web */}
       <div 
         className="fixed top-0 left-0 right-0 h-32 bg-[#00a884] dark:bg-[#00a884]/20 -z-10" 
       />
 
       {/* Main Container */}
-      <div className="w-full h-full max-w-[1700px] mx-auto flex shadow-2xl overflow-hidden relative">
+      <div className="w-full flex-1 max-w-[1700px] mx-auto flex shadow-2xl overflow-hidden relative">
         {/* Sidebar */}
         <div 
           className={`h-full ${
